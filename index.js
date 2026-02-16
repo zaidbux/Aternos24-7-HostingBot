@@ -17,7 +17,8 @@ let botState = {
   lastActivity: Date.now(),
   reconnectAttempts: 0,
   startTime: Date.now(),
-  errors: []
+  errors: [],
+  wasThrottled: false  // Track if last disconnect was a throttle kick
 };
 
 // Health check endpoint for monitoring
@@ -333,15 +334,23 @@ function addInterval(callback, delay) {
 }
 
 function getReconnectDelay() {
-  // Aggressive reconnection: 1-10 seconds as requested
-  const baseDelay = 1000;
-  const maxDelay = 10000;
+  // If we got throttled, wait longer to avoid getting banned
+  if (botState.wasThrottled) {
+    botState.wasThrottled = false; // Reset flag
+    const throttleDelay = 60000 + Math.floor(Math.random() * 60000); // 60-120 seconds
+    console.log(`[Bot] Throttle detected - using extended delay: ${throttleDelay / 1000}s`);
+    return throttleDelay;
+  }
 
-  // Use a much gentler backoff or just a flat delay if user wants "lower"
-  // Current logic: attempts * 1000 + base, capped at max
-  const delay = Math.min(baseDelay + (botState.reconnectAttempts * 1000), maxDelay);
+  // Normal reconnect: fast but with exponential backoff
+  // 3s -> 6s -> 12s -> 24s -> 30s (cap)
+  const baseDelay = 3000;
+  const maxDelay = 30000;
+  const delay = Math.min(baseDelay * Math.pow(2, botState.reconnectAttempts), maxDelay);
 
-  return delay;
+  // Add jitter to prevent thundering herd
+  const jitter = Math.floor(Math.random() * 2000);
+  return delay + jitter;
 }
 
 function createBot() {
@@ -378,9 +387,6 @@ function createBot() {
     });
 
     bot.loadPlugin(pathfinder);
-
-    // Setup enhanced Leave/Rejoin logic (Session rotation to evade Aternos detection)
-    setupLeaveRejoin(bot, createBot);
 
     // Connection timeout - if no spawn in 60s, reconnect
     const connectionTimeout = setTimeout(() => {
@@ -447,11 +453,17 @@ function createBot() {
     });
 
     bot.on('kicked', (reason) => {
-      const wasSpawned = botState.connected;
       console.log(`[Bot] Kicked: ${reason}`);
       botState.connected = false;
       botState.errors.push({ type: 'kicked', reason, time: Date.now() });
       clearAllIntervals();
+
+      // Detect throttle kicks and set flag for longer backoff
+      const reasonStr = String(reason).toLowerCase();
+      if (reasonStr.includes('throttl') || reasonStr.includes('wait before reconnect') || reasonStr.includes('too fast')) {
+        console.log('[Bot] Throttle kick detected - will use extended reconnect delay');
+        botState.wasThrottled = true;
+      }
 
       if (config.discord && config.discord.events.disconnect) {
         sendDiscordWebhook(`[!] **Kicked**: ${reason}`, 0xff0000); // Bright Red
@@ -463,8 +475,14 @@ function createBot() {
     });
 
     bot.on('error', (err) => {
-      console.log(`[Bot] Error: ${err.message}`);
-      botState.errors.push({ type: 'error', message: err.message, time: Date.now() });
+      const msg = err.message || '';
+      console.log(`[Bot] Error: ${msg}`);
+      botState.errors.push({ type: 'error', message: msg, time: Date.now() });
+
+      // Handle known recoverable errors gracefully
+      if (msg.includes('ECONNRESET') || msg.includes('EPIPE') || msg.includes('ETIMEDOUT') || msg.includes('PartialReadError')) {
+        console.log('[Bot] Known network/protocol error - will reconnect on end event');
+      }
       // Don't immediately reconnect on error - let 'end' event handle it
     });
 
@@ -536,20 +554,80 @@ function initializeModules(bot, mcData, defaultMove) {
     bot.pathfinder.setGoal(new GoalBlock(config.position.x, config.position.y, config.position.z));
   }
 
-  // ---------- ANTI-AFK (Simple) ----------
+  // ---------- ANTI-AFK (Enhanced with fidget behaviors) ----------
   if (config.utils['anti-afk'].enabled) {
+    // Random jumping (every 20-60 seconds)
     addInterval(() => {
-      if (bot && botState.connected) {
+      if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
+      try {
         bot.setControlState('jump', true);
         setTimeout(() => {
-          if (bot) bot.setControlState('jump', false);
-        }, 100);
+          if (bot && typeof bot.setControlState === 'function') bot.setControlState('jump', false);
+        }, 300);
         botState.lastActivity = Date.now();
+      } catch (e) {
+        console.log('[AntiAFK] Jump error:', e.message);
       }
-    }, 3000); // Jump every 30 seconds
+    }, 20000 + Math.floor(Math.random() * 40000));
+
+    // Arm swinging (every 10-60 seconds)
+    addInterval(() => {
+      if (!bot || !botState.connected) return;
+      try {
+        bot.swingArm();
+      } catch (e) { }
+    }, 10000 + Math.floor(Math.random() * 50000));
+
+    // Hotbar cycling (every 30-120 seconds)
+    addInterval(() => {
+      if (!bot || !botState.connected) return;
+      try {
+        const slot = Math.floor(Math.random() * 9);
+        bot.setQuickBarSlot(slot);
+      } catch (e) { }
+    }, 30000 + Math.floor(Math.random() * 90000));
+
+    // Teabagging / rapid sneak (10% chance every 2-5 minutes)
+    addInterval(() => {
+      if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
+      if (Math.random() > 0.9) {
+        let count = 2 + Math.floor(Math.random() * 4);
+        const doTeabag = () => {
+          if (count <= 0 || !bot || typeof bot.setControlState !== 'function') return;
+          try {
+            bot.setControlState('sneak', true);
+            setTimeout(() => {
+              if (bot && typeof bot.setControlState === 'function') bot.setControlState('sneak', false);
+              count--;
+              setTimeout(doTeabag, 150);
+            }, 150);
+          } catch (e) { }
+        };
+        doTeabag();
+      }
+    }, 120000 + Math.floor(Math.random() * 180000));
+
+    // Micro-walk: walk forward briefly (every 2-8 minutes)
+    addInterval(() => {
+      if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
+      try {
+        // Look in a random direction then walk briefly
+        const yaw = Math.random() * Math.PI * 2;
+        bot.look(yaw, 0, true);
+        bot.setControlState('forward', true);
+        setTimeout(() => {
+          if (bot && typeof bot.setControlState === 'function') bot.setControlState('forward', false);
+        }, 500 + Math.floor(Math.random() * 2000));
+        botState.lastActivity = Date.now();
+      } catch (e) {
+        console.log('[AntiAFK] Walk error:', e.message);
+      }
+    }, 120000 + Math.floor(Math.random() * 360000));
 
     if (config.utils['anti-afk'].sneak) {
-      bot.setControlState('sneak', true);
+      try {
+        if (typeof bot.setControlState === 'function') bot.setControlState('sneak', true);
+      } catch (e) { }
     }
   }
 
@@ -570,22 +648,13 @@ function initializeModules(bot, mcData, defaultMove) {
   if (config.modules.beds) bedModule(bot, mcData);
   if (config.modules.chat) chatModule(bot);
 
-  // Periodic Rejoin
-  if (config.utils['periodic-rejoin'] && config.utils['periodic-rejoin'].enabled) {
-    periodicRejoin(bot);
-  }
+  // Periodic Rejoin - REMOVED (was causing Aternos to stop the server)
+  // Bot now stays connected permanently and uses fidget behaviors instead.
 
   console.log('[Modules] All modules initialized!');
 }
 
-// Periodic Rejoin Module
-const setupLeaveRejoin = require('./leaveRejoin');
-
-// Periodic Rejoin Module - Handled by leaveRejoin.js now
-function periodicRejoin(bot) {
-  // Deprecated in favor of leaveRejoin.js
-  console.log('[Rejoin] Using new leaveRejoin system.');
-}
+// leaveRejoin.js has been removed - all AFK behaviors are now inline above
 
 // ============================================================
 // MOVEMENT HELPERS
@@ -618,11 +687,11 @@ function startCircleWalk(bot, defaultMove) {
 
 function startRandomJump(bot) {
   addInterval(() => {
-    if (!bot || !botState.connected) return;
+    if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
     try {
       bot.setControlState('jump', true);
       setTimeout(() => {
-        if (bot) bot.setControlState('jump', false);
+        if (bot && typeof bot.setControlState === 'function') bot.setControlState('jump', false);
       }, 300);
       botState.lastActivity = Date.now();
     } catch (e) {
@@ -653,7 +722,7 @@ function startLookAround(bot) {
 function avoidMobs(bot) {
   const safeDistance = 5;
   addInterval(() => {
-    if (!bot || !botState.connected) return;
+    if (!bot || !botState.connected || typeof bot.setControlState !== 'function') return;
     try {
       const entities = Object.values(bot.entities).filter(e =>
         e.type === 'mob' || (e.type === 'player' && e.username !== bot.username)
@@ -664,7 +733,7 @@ function avoidMobs(bot) {
         if (distance < safeDistance) {
           bot.setControlState('back', true);
           setTimeout(() => {
-            if (bot) bot.setControlState('back', false);
+            if (bot && typeof bot.setControlState === 'function') bot.setControlState('back', false);
           }, 500);
           break;
         }
@@ -843,19 +912,28 @@ function sendDiscordWebhook(content, color = 0x0099ff) {
 // CRASH RECOVERY - IMMORTAL MODE
 // ============================================================
 process.on('uncaughtException', (err) => {
-  console.log(`[FATAL] Uncaught Exception: ${err.message}`);
-  // console.log(err.stack); // Optional: keep logs cleaner
-  botState.errors.push({ type: 'uncaught', message: err.message, time: Date.now() });
+  const msg = err.message || 'Unknown';
+  console.log(`[FATAL] Uncaught Exception: ${msg}`);
+  botState.errors.push({ type: 'uncaught', message: msg, time: Date.now() });
+
+  // Identify known recoverable errors
+  const isNetworkError = msg.includes('PartialReadError') || msg.includes('ECONNRESET') ||
+    msg.includes('EPIPE') || msg.includes('ETIMEDOUT') || msg.includes('timed out') ||
+    msg.includes('write after end') || msg.includes('This socket has been ended');
+
+  if (isNetworkError) {
+    console.log('[FATAL] Known network/protocol error - recovering gracefully...');
+  }
 
   // CRITICAL: DO NOT EXIT.
-  // The user wants the server to stay up "all the time no matter what".
-  // We just clear intervals and try to restart the bot logic.
+  // Clear intervals and schedule reconnect with a safe delay
   if (config.utils['auto-reconnect']) {
     clearAllIntervals();
-    // Wrap in a tiny timeout to prevent tight loops if the error is synchronous
+    botState.connected = false;
+    // Wait a bit longer after a crash to avoid tight loops
     setTimeout(() => {
       scheduleReconnect();
-    }, 1000);
+    }, isNetworkError ? 5000 : 10000);
   }
 });
 
@@ -884,7 +962,7 @@ process.on('SIGINT', () => {
 // START THE BOT
 // ============================================================
 console.log('='.repeat(50));
-console.log('  Minecraft AFK Bot v2.3 - Bug Fix Edition');
+console.log('  Minecraft AFK Bot v2.4 - Stability Edition');
 console.log('='.repeat(50));
 console.log(`Server: ${config.server.ip}:${config.server.port}`);
 console.log(`Version: ${config.server.version}`);
