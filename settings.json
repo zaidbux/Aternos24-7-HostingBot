@@ -6,8 +6,8 @@
     "type": "offline"
   },
   "server": {
-    "ip": "ricoiscool.aternos.me",
-    "port": 56559,
+    "ip": "zaidbux.aternos.me:63002",
+    "port":  63002,
     "version": "1.21.1"
   },
   "position": {
