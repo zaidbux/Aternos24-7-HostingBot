@@ -6,7 +6,7 @@
     "type": "offline"
   },
   "server": {
-    "ip": "zaidbux.aternos.me:63002",
+    "ip": "zaidbux.aternos.me",
     "port":  63002,
     "version": "1.21.1"
   },
